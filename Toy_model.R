@@ -1,25 +1,29 @@
 # ============================================================
-# LATENT SPACE MODEL FOR RANK DATA (Gormley & Murphy, 2006)
-# FULL VERSION WITH PCA + CONFIDENCE ELLIPSES
+# LATENT SPACE MODEL FOR RANK DATA (Modified for Oboe Multiphonics)
+# Incorporates participant sensitivities b_s and baseline appeal c_j
 # ============================================================
 
-
 # ------------------------------------------------------------
-# Distance + Likelihood
+# Squared distance function
 # ------------------------------------------------------------
-
-sq_dist <- function(z, ZETA) {
-  rowSums((ZETA - matrix(z, nrow(ZETA), length(z), byrow = TRUE))^2)
+sq_dist <- function(y, x) {
+  rowSums((x - matrix(y, nrow(x), length(y), byrow = TRUE))^2)
 }
 
-log_plackett_luce <- function(ranking, d_vec) {
+# ------------------------------------------------------------
+# Log Plackett-Luce likelihood for a single ranking
+# ------------------------------------------------------------
+log_plackett_luce <- function(ranking, y, X, c, b) {
   remaining <- ranking
   loglik <- 0
   
+  d_vec <- sq_dist(y, X) # squared distances from y to each x
+  
   for (t in seq_along(ranking)) {
-    num <- exp(-d_vec[remaining[1]])
-    denom <- sum(exp(-d_vec[remaining]))
-    loglik <- loglik + log(num / denom)
+    j <- remaining[1]
+    numerator <- exp(c[j] - b * d_vec[j])
+    denominator <- sum(exp(c[remaining] - b * d_vec[remaining]))
+    loglik <- loglik + log(numerator / denominator)
     remaining <- remaining[-1]
     if (length(remaining) == 0) break
   }
@@ -27,141 +31,177 @@ log_plackett_luce <- function(ranking, d_vec) {
   return(loglik)
 }
 
-
-log_posterior <- function(Z, ZETA, rankings,
-                          sigma_v = 3, sigma_c = 3) {
-  
-  M <- nrow(Z)
+# ------------------------------------------------------------
+# Log-posterior
+# ------------------------------------------------------------
+log_posterior <- function(Y, X, c, b, rankings,
+                          sigma_y=3, sigma_x=3, sigma_c=3, mu_b=1, sigma_b=1) {
+  S <- length(rankings)
   loglik <- 0
   
-  for (i in 1:M) {
-    d_vec <- sq_dist(Z[i, ], ZETA)
-    loglik <- loglik + log_plackett_luce(rankings[[i]], d_vec)
+  for (s in 1:S) {
+    R_s <- length(rankings[[s]]) # number of rankings for participant s
+    for (r in 1:R_s) {
+      loglik <- loglik + log_plackett_luce(rankings[[s]][[r]], Y[[s]][[r]], X, c, b[s])
+    }
   }
   
-  logprior_Z <- sum(dnorm(Z, 0, sigma_v, log = TRUE))
-  logprior_ZETA <- sum(dnorm(ZETA, 0, sigma_c, log = TRUE))
+  # Priors
+  logprior_Y <- sum(sapply(Y, function(Ys) sum(sapply(Ys, function(y) dnorm(y, 0, sigma_y, log=TRUE)))))
+  logprior_X <- sum(apply(X, 1, function(xj) sum(dnorm(xj, 0, sigma_x, log=TRUE))))
+  logprior_c <- sum(dnorm(c, 0, sigma_c, log=TRUE))
+  logprior_b <- sum(dnorm(b, mu_b, sigma_b, log=TRUE))
   
-  return(loglik + logprior_Z + logprior_ZETA)
+  return(loglik + logprior_Y + logprior_X + logprior_c + logprior_b)
 }
 
-
 # ------------------------------------------------------------
-# Local updates
+# Metropolis-Hastings Sampler
 # ------------------------------------------------------------
-
-loglik_voter_i <- function(i, Z, ZETA, rankings) {
-  d_vec <- sq_dist(Z[i, ], ZETA)
-  log_plackett_luce(rankings[[i]], d_vec)
-}
-
-
-# ------------------------------------------------------------
-# Procrustes alignment
-# ------------------------------------------------------------
-
-procrustes_align <- function(Z, ZETA, Z_ref, ZETA_ref) {
-  C <- rbind(Z, ZETA)
-  C_ref <- rbind(Z_ref, ZETA_ref)
+latent_rank_MH <- function(rankings, D=2, n_iter=3000, burn_in=1000,
+                           sigma_prop_y=0.3, sigma_prop_x=0.05,
+                           sigma_y=3, sigma_x=3, sigma_c=3,
+                           mu_b=1, sigma_b=1) {
   
-  C <- scale(C, center = TRUE, scale = FALSE)
-  C_ref <- scale(C_ref, center = TRUE, scale = FALSE)
+  S <- length(rankings)       # number of participants
+  R <- length(rankings[[1]])  # number of rankings per participant (assume same)
+  N <- ncol(rankings[[1]][[1]]) # number of oboe multiphonics
   
-  svd_res <- svd(t(C_ref) %*% C)
-  Q <- svd_res$v %*% t(svd_res$u)
+  # Initialize latent locations and parameters
+  Y <- lapply(1:S, function(s) lapply(1:R, function(r) rnorm(D)))  # participant rankings
+  X <- matrix(rnorm(N*D), N, D)                                     # oboe multiphonics
+  c <- rnorm(N)                                                      # baseline appeal
+  b <- rnorm(S, mu_b, sigma_b)                                       # sensitivities
   
-  C_rot <- C %*% Q
-  
-  M <- nrow(Z)
-  list(
-    Z = C_rot[1:M, ],
-    ZETA = C_rot[(M+1):nrow(C_rot), ]
-  )
-}
-
-
-# ------------------------------------------------------------
-# MCMC Sampler
-# ------------------------------------------------------------
-
-latent_rank_MH <- function(rankings,
-                           D = 2,
-                           n_iter = 3000,
-                           burn_in = 1000,
-                           sigma_prop_z = 0.3,
-                           sigma_prop_zeta = 0.05,
-                           sigma_v = 3,
-                           sigma_c = 3) {
-  
-  M <- length(rankings)
-  N <- max(unlist(rankings))
-  
-  Z <- matrix(rnorm(M * D), M, D)
-  ZETA <- matrix(rnorm(N * D), N, D)
-  
-  samples_Z <- array(NA, c(M, D, n_iter))
-  samples_ZETA <- array(NA, c(N, D, n_iter))
-  
-  Z_ref <- Z
-  ZETA_ref <- ZETA
+  # Storage
+  samples_Y <- vector("list", S)
+  for (s in 1:S) samples_Y[[s]] <- array(NA, c(R, D, n_iter))
+  samples_X <- array(NA, c(N, D, n_iter))
+  samples_c <- matrix(NA, N, n_iter)
+  samples_b <- matrix(NA, S, n_iter)
   
   for (iter in 1:n_iter) {
     
-    # --- Update voters ---
-    for (i in 1:M) {
-      Z_prop <- Z
-      Z_prop[i, ] <- Z[i, ] + rnorm(D, 0, sigma_prop_z)
-      
-      log_alpha <- (
-        loglik_voter_i(i, Z_prop, ZETA, rankings) -
-        loglik_voter_i(i, Z, ZETA, rankings)
-      ) + (
-        sum(dnorm(Z_prop[i, ], 0, sigma_v, log=TRUE)) -
-        sum(dnorm(Z[i, ], 0, sigma_v, log=TRUE))
-      )
-      
-      if (log(runif(1)) < log_alpha) {
-        Z <- Z_prop
+    # --- Update participant locations ---
+    for (s in 1:S) {
+      for (r in 1:R) {
+        y_prop <- Y[[s]][[r]] + rnorm(D, 0, sigma_prop_y)
+        log_alpha <- log_plackett_luce(rankings[[s]][[r]], y_prop, X, c, b[s]) -
+                     log_plackett_luce(rankings[[s]][[r]], Y[[s]][[r]], X, c, b[s]) +
+                     sum(dnorm(y_prop, 0, sigma_y, log=TRUE)) -
+                     sum(dnorm(Y[[s]][[r]], 0, sigma_y, log=TRUE))
+        if (log(runif(1)) < log_alpha) Y[[s]][[r]] <- y_prop
       }
     }
     
-    # --- Update candidates ---
+    # --- Update oboe multiphonic locations ---
     for (j in 1:N) {
-      ZETA_prop <- ZETA
-      ZETA_prop[j, ] <- ZETA[j, ] + rnorm(D, 0, sigma_prop_zeta)
-      
-      log_alpha <- log_posterior(Z, ZETA_prop, rankings) -
-                   log_posterior(Z, ZETA, rankings)
-      
-      if (log(runif(1)) < log_alpha) {
-        ZETA <- ZETA_prop
-      }
+      x_prop <- X[j,] + rnorm(D, 0, sigma_prop_x)
+      log_alpha <- log_posterior(Y, rbind(X[-j,], x_prop), c, b, rankings,
+                                 sigma_y, sigma_x, sigma_c, mu_b, sigma_b) -
+                   log_posterior(Y, X, c, b, rankings, sigma_y, sigma_x, sigma_c, mu_b, sigma_b)
+      if (log(runif(1)) < log_alpha) X[j,] <- x_prop
     }
     
-    # --- Procrustes ---
-    if (iter > burn_in) {
-      aligned <- procrustes_align(Z, ZETA, Z_ref, ZETA_ref)
-      Z <- aligned$Z
-      ZETA <- aligned$ZETA
+    # --- Update baseline appeals ---
+    for (j in 1:N) {
+      c_prop <- c
+      c_prop[j] <- c[j] + rnorm(1, 0, sigma_prop_x)
+      log_alpha <- log_posterior(Y, X, c_prop, b, rankings,
+                                 sigma_y, sigma_x, sigma_c, mu_b, sigma_b) -
+                   log_posterior(Y, X, c, b, rankings, sigma_y, sigma_x, sigma_c, mu_b, sigma_b)
+      if (log(runif(1)) < log_alpha) c[j] <- c_prop[j]
     }
     
-    samples_Z[,,iter] <- Z
-    samples_ZETA[,,iter] <- ZETA
+    # --- Update sensitivities ---
+    for (s in 1:S) {
+      b_prop <- b[s] + rnorm(1, 0, sigma_prop_x)
+      log_alpha <- log_posterior(Y, X, c, replace(b, s, b_prop), rankings,
+                                 sigma_y, sigma_x, sigma_c, mu_b, sigma_b) -
+                   log_posterior(Y, X, c, b, rankings, sigma_y, sigma_x, sigma_c, mu_b, sigma_b)
+      if (log(runif(1)) < log_alpha) b[s] <- b_prop
+    }
+    
+    # --- Store samples ---
+    for (s in 1:S) for (r in 1:R) samples_Y[[s]][r,,iter] <- Y[[s]][[r]]
+    samples_X[,,iter] <- X
+    samples_c[,iter] <- c
+    samples_b[,iter] <- b
+    
+    if (iter %% 100 == 0) cat("Iteration:", iter, "\n")
   }
   
-  return(list(samples_Z = samples_Z,
-              samples_ZETA = samples_ZETA))
+  list(samples_Y=samples_Y, samples_X=samples_X,
+       samples_c=samples_c, samples_b=samples_b)
 }
 
 
-# ------------------------------------------------------------
-# Posterior summaries + covariance
-# ------------------------------------------------------------
 
-compute_candidate_stats <- function(samples_ZETA, burn_in=1000) {
+
+
+
+
+
+
+# ============================================================
+# EXAMPLE: Simulated Data, Fit Model, Plot Latent Spaces
+# ============================================================
+
+set.seed(123)
+
+S <- 5   # number of participants
+R <- 14  # rankings per participant
+N <- 7   # oboe multiphonics
+D <- 2   # latent space dimensions
+
+# Generate "true" latent locations
+true_X <- matrix(rnorm(N * D, 0, 1), N, D)
+true_c <- rnorm(N, 0, 1)
+true_b <- runif(S, 0.5, 1.5)
+
+# Function to simulate a single ranking
+simulate_ranking <- function(y, X, c, b) {
+  remaining <- 1:N
+  ranking <- numeric(N)
   
-  samples <- samples_ZETA[,,(burn_in+1):dim(samples_ZETA)[3]]
-  
+  for (t in 1:N) {
+    probs <- exp(c[remaining] - b * rowSums((X[remaining, , drop=FALSE] - matrix(y, length(remaining), D, byrow=TRUE))^2))
+    probs <- probs / sum(probs)
+    choice <- sample(length(remaining), 1, prob=probs)
+    ranking[t] <- remaining[choice]
+    remaining <- remaining[-choice]
+  }
+  return(ranking)
+}
+
+# Simulate participant rankings
+rankings <- vector("list", S)
+Y_true <- vector("list", S)
+
+for (s in 1:S) {
+  rankings[[s]] <- vector("list", R)
+  Y_true[[s]] <- vector("list", R)
+  for (r in 1:R) {
+    # participant latent location for ranking r
+    y <- rnorm(D, 0, 1)
+    Y_true[[s]][[r]] <- y
+    rankings[[s]][[r]] <- simulate_ranking(y, true_X, true_c, true_b[s])
+  }
+}
+
+# ============================================================
+# Fit the model using Metropolis-Hastings
+# ============================================================
+fit <- latent_rank_MH(rankings, D=D, n_iter=2000, burn_in=1000,
+                      sigma_prop_y=0.3, sigma_prop_x=0.05,
+                      sigma_y=1.5, sigma_x=1.5, sigma_c=1.5,
+                      mu_b=1, sigma_b=0.5)
+
+# ============================================================
+# Posterior summaries for oboe multiphonics
+# ============================================================
+compute_candidate_stats <- function(samples_X, burn_in=1000) {
+  samples <- samples_X[,,(burn_in+1):dim(samples_X)[3]]
   N <- dim(samples)[1]
   D <- dim(samples)[2]
   
@@ -174,30 +214,14 @@ compute_candidate_stats <- function(samples_ZETA, burn_in=1000) {
     covs[[j]] <- cov(draws)
   }
   
-  list(means = means, covs = covs)
+  list(means=means, covs=covs)
 }
 
+stats <- compute_candidate_stats(fit$samples_X, burn_in=1000)
 
-# ------------------------------------------------------------
-# PCA for dimension selection
-# ------------------------------------------------------------
-
-run_pca <- function(ZETA_mean) {
-  pca <- prcomp(ZETA_mean)
-  var_exp <- pca$sdev^2 / sum(pca$sdev^2)
-  
-  print(var_exp)
-  
-  plot(var_exp, type="b", pch=19,
-       main="PCA Variance Explained",
-       xlab="Component", ylab="Variance")
-}
-
-
-# ------------------------------------------------------------
-# Ellipse plotting
-# ------------------------------------------------------------
-
+# ============================================================
+# Plotting 95% confidence ellipses
+# ============================================================
 plot_ellipse <- function(mu, Sigma, level=0.95, npoints=100) {
   theta <- seq(0, 2*pi, length.out=npoints)
   circle <- cbind(cos(theta), sin(theta))
@@ -206,43 +230,21 @@ plot_ellipse <- function(mu, Sigma, level=0.95, npoints=100) {
   radius <- sqrt(qchisq(level, df=2))
   
   ellipse <- t(mu + radius * t(circle %*% diag(sqrt(eig$values)) %*% t(eig$vectors)))
-  
   lines(ellipse)
 }
 
-
 plot_latent_space <- function(means, covs) {
-  
-  plot(means, pch=19,
+  plot(means, pch=19, col="blue",
        xlab="Dim 1", ylab="Dim 2",
-       main="Latent Candidate Space with 95% Ellipses")
-  
+       main="Latent Space of Oboe Multiphonics with 95% Ellipses",
+       xlim=range(means[,1]) + c(-1,1), ylim=range(means[,2]) + c(-1,1))
   text(means, labels=1:nrow(means), pos=3)
-  
   for (j in 1:nrow(means)) {
     plot_ellipse(means[j,], covs[[j]])
   }
 }
 
-
-# ============================================================
-# EXAMPLE RUN
-# ============================================================
-
-rankings <- list(
-  c(1,2,3,4),
-  c(2,1,4,3),
-  c(1,3,2,4),
-  c(3,1,2,4)
-)
-
-fit <- latent_rank_MH(rankings, D=2, n_iter=3000)
-
-# --- Posterior stats
-stats <- compute_candidate_stats(fit$samples_ZETA, burn_in=1000)
-
-# --- Plot latent space with uncertainty
 plot_latent_space(stats$means, stats$covs)
 
-# --- PCA diagnostic
-run_pca(stats$means)
+
+
