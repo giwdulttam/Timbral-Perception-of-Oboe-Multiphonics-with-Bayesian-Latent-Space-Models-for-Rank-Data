@@ -1,17 +1,39 @@
 """
-Sample rankings + Bayesian latent-space fit (Plackett–Luce) following:
+Bayesian latent-space Plackett-Luce model for oboe-multiphonic ranking data.
 
-  • Gormley & Murphy / “paper17” latent geometry + Metropolis–Hastings +
-    Procrustean post-processing (MAP reference, orthogonal rotation after centering).
+MODEL (per the manuscript "main", Sections 4-5 and Appendix A; replaces the
+Gormley & Murphy 2006 voter/candidate parameterization):
 
-  • Main (11) / oboe-multiphonics extension: per-(participant, trial) ideal points
-    y_sr, item locations x_j, baseline appeals c_j, sensitivities b_s > 0,
-    η_sr,j = c_j − b_s * ‖y_sr − x_j‖² with ‖·‖² the GM06 mean-squared distance
-    (divide squared Euclidean by D), priors N(0,I) on locations, N(0,1) on c_j,
-    Gamma(25, 1/24) on b_s, and log-scale random-walk proposals for b_s.
+  Latent variables
+    y_r  in R^D : location of orchestral target sound r      (SHARED across participants)
+    x_j  in R^D : location of oboe multiphonic j
+    c_j  in R   : baseline appeal of multiphonic j
+    b_s  > 0    : sensitivity of participant s
 
-Run this file: it writes multiphonics_rankings.csv, fits the model for D in {1,2,3},
-prints posterior draw tables, and opens interactive plots (dimension pair + traces).
+  Support score (squared Euclidean distance -- NO division by D):
+    eta_srj = c_j - b_s * ||y_r - x_j||^2
+
+  Plackett-Luce likelihood of a complete ranking k_sr = (k_sr1, ..., k_srN):
+    P(k_sr) = prod_{t=1}^{N} exp(eta_sr,k_srt) / sum_{u=t}^{N} exp(eta_sr,k_sru)
+
+  Priors:
+    y_r ~ N(0, I_D),  x_j ~ N(0, I_D),  c_j ~ N(0, 1),
+    b_s ~ Gamma(shape=25, scale=1/24)    [mean ~= 1.042, sd ~= 0.208]
+
+  MCMC: block Metropolis-Hastings.
+    y_r, x_j, c_j : Gaussian random walk (symmetric proposal, no Hastings term).
+    b_s           : log-scale random walk with Jacobian correction  + log(b*/b).
+  MAP/uphill phase first (GM06 / paper17 Sec. 4.1) to build the Procrustes
+  reference configuration C_R; sampling draws are aligned draw-by-draw.
+  Procrustes acts ONLY on the stacked latent coordinates {y_r} u {x_j};
+  c and b are location/rotation invariant and are never transformed.
+
+DATA STRUCTURE (inferred empirically, see infer_structure()):
+  450 rows = 30 participants x 15 targets, participant-major
+  (rows 15*(s-1) .. 15*s - 1 are participant s's rankings of targets 1..15;
+  within-target Kendall-tau agreement ~0.85 vs ~0.19 for random row pairs).
+  NOTE: the manuscript states R = 14 targets; the present dataset contains 15.
+  Reconcile before publication -- set R_TASKS below if the design changes.
 """
 
 from __future__ import annotations
@@ -23,1079 +45,486 @@ import matplotlib.pyplot as plt
 from matplotlib.widgets import RadioButtons, Slider
 from pathlib import Path
 
-# -----------------------------------------------------------------------------
-# 1. Simulate toy ranking data (same structure as before)
-# -----------------------------------------------------------------------------
-# np.random.seed(42)
-
-# participants = 15
-# trials = 15
-# items = 7
-
-# rows = []
-# for p in range(1, participants + 1):
-#     for t in range(1, trials + 1):
-#         ranking = np.random.permutation(np.arange(1, items + 1))
-#         rows.append([p, t] + ranking.tolist())
-
-# df = pd.DataFrame(rows, columns=["participant", "trial"] + [f"m{i}" for i in range(1, 8)])
-# df.to_csv("multiphonics_rankings.csv", index=False)
-
-
+from rankdata import raw_data  # (450, 7) rank matrix: entry = rank of multiphonic j (1 = best)
 
 # -----------------------------------------------------------------------------
-# 1. Load provided ranking data (REAL DATA)
+# 0. Experimental design constants
+# -----------------------------------------------------------------------------
+R_TASKS = 15  # number of orchestral target sounds actually present in the data
+              # (manuscript Section 3 says 14 -- see module docstring)
+
+# -----------------------------------------------------------------------------
+# 1. Load ranking data -> long CSV with correct (participant, target) labels
 # -----------------------------------------------------------------------------
 
-import numpy as np
 
-raw_data = np.array([
-    [1, 2, 3, 4, 5, 6, 7],
-    [2, 1, 5, 6, 3, 4, 7],
-    [4, 1, 5, 6, 2, 3, 7],
-    [1, 5, 3, 4, 2, 6, 7],
-    [2, 5, 1, 6, 3, 7, 4],
-    [2, 7, 1, 4, 3, 6, 5],
-    [2, 4, 1, 7, 3, 5, 6],
-    [6, 5, 4, 1, 2, 3, 7],
-    [5, 6, 2, 3, 4, 7, 1],
-    [4, 3, 6, 2, 5, 1, 7],
-    [4, 2, 6, 5, 3, 1, 7],
-    [5, 6, 3, 1, 2, 4, 7],
-    [4, 5, 6, 1, 2, 3, 7],
-    [2, 3, 1, 7, 4, 5, 6],
-    [5, 7, 3, 1, 2, 6, 4],
-    [3, 6, 2, 5, 4, 7, 1],
-    [4, 1, 5, 6, 2, 3, 7],
-    [4, 1, 5, 6, 3, 2, 7],
-    [2, 4, 3, 6, 1, 5, 7],
-    [2, 6, 1, 5, 3, 7, 4],
-    [2, 7, 1, 5, 3, 6, 4],
-    [1, 4, 2, 5, 3, 6, 7],
-    [4, 6, 5, 1, 3, 2, 7],
-    [3, 6, 2, 5, 4, 7, 1],
-    [5, 3, 6, 2, 4, 1, 7],
-    [4, 1, 6, 5, 3, 2, 7],
-    [3, 6, 4, 1, 2, 5, 7],
-    [4, 5, 6, 1, 3, 2, 7],
-    [1, 4, 2, 7, 3, 5, 6],
-    [4, 7, 1, 2, 3, 6, 5],
-    [4, 6, 2, 5, 3, 7, 1],
-    [4, 1, 5, 6, 3, 2, 7],
-    [4, 1, 6, 5, 2, 3, 7],
-    [3, 4, 2, 5, 1, 6, 7],
-    [2, 6, 1, 5, 3, 7, 4],
-    [3, 6, 1, 5, 2, 7, 4],
-    [1, 4, 2, 7, 3, 6, 5],
-    [3, 6, 5, 1, 4, 2, 7],
-    [3, 7, 2, 5, 4, 6, 1],
-    [5, 2, 6, 4, 3, 1, 7],
-    [5, 2, 4, 6, 3, 1, 7],
-    [3, 5, 6, 1, 2, 4, 7],
-    [4, 5, 6, 2, 3, 1, 7],
-    [1, 4, 3, 6, 2, 5, 7],
-    [3, 7, 4, 1, 2, 6, 5],
-    [3, 6, 2, 5, 4, 7, 1],
-    [2, 1, 5, 6, 4, 3, 7],
-    [4, 1, 5, 6, 2, 3, 7],
-    [2, 5, 3, 4, 1, 6, 7],
-    [2, 5, 1, 6, 3, 7, 4],
-    [2, 6, 1, 5, 3, 7, 4],
-    [1, 4, 2, 5, 3, 7, 6],
-    [4, 5, 6, 1, 3, 2, 7],
-    [3, 6, 2, 5, 4, 7, 1],
-    [5, 4, 6, 2, 3, 1, 7],
-    [4, 1, 6, 5, 3, 2, 7],
-    [4, 6, 5, 1, 2, 3, 7],
-    [5, 4, 6, 1, 3, 2, 7],
-    [1, 4, 2, 6, 3, 5, 7],
-    [4, 7, 3, 1, 2, 6, 5],
-    [3, 6, 2, 5, 4, 7, 1],
-    [3, 1, 5, 6, 4, 2, 7],
-    [4, 1, 5, 6, 3, 2, 7],
-    [3, 6, 2, 4, 1, 5, 7],
-    [2, 6, 1, 5, 4, 7, 3],
-    [3, 7, 1, 4, 2, 6, 5],
-    [1, 4, 2, 5, 3, 6, 7],
-    [5, 4, 6, 1, 2, 3, 7],
-    [4, 6, 2, 3, 5, 7, 1],
-    [5, 4, 6, 3, 2, 1, 7],
-    [4, 1, 6, 5, 3, 2, 7],
-    [6, 5, 4, 1, 2, 3, 7],
-    [5, 4, 6, 1, 3, 2, 7],
-    [1, 4, 2, 6, 3, 5, 7],
-    [5, 7, 3, 1, 2, 6, 4],
-    [3, 6, 2, 5, 4, 7, 1],
-    [4, 1, 5, 6, 3, 2, 7],
-    [4, 1, 5, 6, 2, 3, 7],
-    [1, 6, 2, 5, 3, 4, 7],
-    [2, 5, 1, 7, 3, 6, 4],
-    [2, 7, 1, 5, 4, 6, 3],
-    [1, 4, 2, 7, 3, 5, 6],
-    [4, 5, 6, 1, 2, 3, 7],
-    [3, 6, 2, 4, 5, 7, 1],
-    [5, 3, 6, 4, 2, 1, 7],
-    [4, 1, 6, 5, 3, 2, 7],
-    [4, 5, 6, 1, 2, 3, 7],
-    [5, 4, 6, 1, 3, 2, 7],
-    [1, 4, 2, 6, 3, 5, 7],
-    [4, 7, 3, 1, 2, 6, 5],
-    [3, 7, 2, 5, 4, 6, 1],
-    [2, 1, 5, 6, 3, 4, 7],
-    [4, 1, 5, 6, 2, 3, 7],
-    [2, 5, 3, 4, 1, 6, 7],
-    [2, 5, 1, 7, 4, 6, 3],
-    [2, 7, 1, 5, 3, 6, 4],
-    [1, 4, 2, 7, 3, 5, 6],
-    [4, 6, 5, 1, 3, 2, 7],
-    [3, 6, 2, 4, 5, 7, 1],
-    [5, 4, 6, 2, 3, 1, 7],
-    [4, 1, 6, 5, 3, 2, 7],
-    [5, 6, 4, 1, 2, 3, 7],
-    [4, 5, 6, 1, 3, 2, 7],
-    [1, 4, 2, 7, 3, 5, 6],
-    [4, 7, 3, 1, 2, 5, 6],
-    [3, 6, 2, 5, 4, 7, 1],
-    [3, 1, 5, 6, 2, 4, 7],
-    [4, 1, 6, 5, 3, 2, 7],
-    [2, 5, 3, 4, 1, 6, 7],
-    [2, 6, 1, 5, 3, 7, 4],
-    [3, 6, 1, 5, 4, 7, 2],
-    [1, 4, 2, 5, 3, 7, 6],
-    [4, 6, 5, 1, 2, 3, 7],
-    [3, 6, 2, 4, 5, 7, 1],
-    [5, 4, 6, 3, 2, 1, 7],
-    [4, 1, 6, 5, 3, 2, 7],
-    [5, 6, 4, 1, 2, 3, 7],
-    [5, 4, 6, 1, 3, 2, 7],
-    [1, 3, 2, 5, 4, 7, 6],
-    [4, 7, 3, 1, 2, 6, 5],
-    [3, 6, 2, 4, 5, 7, 1],
-    [2, 1, 5, 6, 3, 4, 7],
-    [4, 1, 5, 6, 2, 3, 7],
-    [2, 5, 1, 4, 3, 6, 7],
-    [2, 6, 1, 5, 3, 7, 4],
-    [2, 6, 1, 4, 3, 7, 5],
-    [1, 4, 2, 5, 3, 6, 7],
-    [5, 6, 4, 1, 2, 3, 7],
-    [4, 6, 2, 3, 5, 7, 1],
-    [5, 4, 6, 3, 2, 1, 7],
-    [4, 1, 5, 6, 3, 2, 7],
-    [5, 6, 3, 1, 2, 4, 7],
-    [4, 5, 6, 1, 3, 2, 7],
-    [1, 3, 2, 7, 4, 5, 6],
-    [4, 7, 3, 1, 2, 6, 5],
-    [3, 6, 2, 4, 5, 7, 1],
-    [2, 1, 4, 6, 5, 3, 7],
-    [4, 1, 5, 6, 3, 2, 7],
-    [1, 5, 3, 4, 2, 6, 7],
-    [2, 6, 1, 5, 3, 7, 4],
-    [2, 7, 1, 4, 3, 6, 5],
-    [1, 4, 2, 6, 3, 7, 5],
-    [4, 6, 5, 1, 2, 3, 7],
-    [3, 6, 2, 5, 4, 7, 1],
-    [5, 4, 6, 2, 3, 1, 7],
-    [4, 2, 6, 5, 3, 1, 7],
-    [3, 6, 5, 2, 1, 4, 7],
-    [4, 5, 6, 1, 3, 2, 7],
-    [1, 3, 2, 6, 4, 5, 7],
-    [3, 7, 4, 1, 2, 5, 6],
-    [3, 6, 2, 4, 5, 7, 1],
-    [3, 1, 5, 6, 2, 4, 7],
-    [5, 2, 6, 4, 3, 1, 7],
-    [1, 6, 3, 4, 2, 5, 7],
-    [2, 6, 1, 5, 4, 7, 3],
-    [3, 7, 1, 4, 2, 6, 5],
-    [2, 4, 1, 5, 3, 7, 6],
-    [4, 5, 6, 1, 3, 2, 7],
-    [4, 6, 2, 3, 5, 7, 1],
-    [5, 4, 6, 3, 2, 1, 7],
-    [4, 1, 6, 5, 3, 2, 7],
-    [5, 6, 4, 1, 3, 2, 7],
-    [6, 5, 4, 1, 3, 2, 7],
-    [1, 3, 2, 6, 4, 5, 7],
-    [3, 7, 2, 1, 4, 5, 6],
-    [3, 6, 2, 5, 4, 7, 1],
-    [3, 1, 5, 6, 2, 4, 7],
-    [4, 1, 5, 6, 2, 3, 7],
-    [2, 5, 3, 4, 1, 6, 7],
-    [2, 5, 1, 6, 3, 7, 4],
-    [2, 7, 1, 5, 3, 6, 4],
-    [1, 4, 2, 5, 3, 6, 7],
-    [4, 5, 6, 1, 3, 2, 7],
-    [3, 7, 2, 4, 5, 6, 1],
-    [5, 3, 6, 4, 2, 1, 7],
-    [4, 1, 5, 6, 3, 2, 7],
-    [4, 6, 5, 1, 2, 3, 7],
-    [4, 5, 6, 1, 3, 2, 7],
-    [1, 4, 2, 7, 3, 5, 6],
-    [4, 7, 3, 1, 2, 6, 5],
-    [3, 6, 2, 5, 4, 7, 1],
-    [3, 1, 5, 6, 2, 4, 7],
-    [4, 1, 6, 5, 3, 2, 7],
-    [2, 5, 3, 4, 1, 6, 7],
-    [2, 6, 1, 5, 3, 7, 4],
-    [2, 7, 1, 4, 3, 6, 5],
-    [1, 4, 2, 6, 3, 5, 7],
-    [4, 5, 6, 1, 3, 2, 7],
-    [3, 6, 2, 4, 5, 7, 1],
-    [5, 4, 6, 3, 2, 1, 7],
-    [4, 1, 6, 5, 3, 2, 7],
-    [4, 6, 5, 1, 2, 3, 7],
-    [4, 5, 6, 1, 3, 2, 7],
-    [1, 3, 2, 6, 4, 5, 7],
-    [4, 7, 3, 1, 2, 6, 5],
-    [3, 6, 2, 5, 4, 7, 1],
-    [3, 1, 5, 6, 2, 4, 7],
-    [3, 1, 5, 6, 2, 4, 7],
-    [1, 4, 2, 5, 3, 6, 7],
-    [2, 5, 1, 6, 4, 7, 3],
-    [4, 7, 1, 5, 3, 6, 2],
-    [2, 4, 1, 5, 3, 6, 7],
-    [4, 5, 6, 1, 3, 2, 7],
-    [3, 6, 2, 4, 5, 7, 1],
-    [5, 2, 6, 3, 4, 1, 7],
-    [4, 1, 6, 5, 3, 2, 7],
-    [4, 6, 5, 1, 2, 3, 7],
-    [4, 5, 6, 1, 3, 2, 7],
-    [2, 4, 1, 7, 3, 5, 6],
-    [4, 7, 3, 1, 2, 6, 5],
-    [4, 7, 2, 5, 3, 6, 1],
-    [4, 1, 5, 6, 3, 2, 7],
-    [4, 1, 5, 6, 2, 3, 7],
-    [2, 5, 1, 4, 3, 6, 7],
-    [2, 5, 1, 6, 4, 7, 3],
-    [3, 6, 1, 4, 5, 7, 2],
-    [1, 4, 2, 5, 3, 6, 7],
-    [4, 6, 5, 1, 2, 3, 7],
-    [3, 7, 2, 5, 4, 6, 1],
-    [4, 5, 6, 3, 2, 1, 7],
-    [4, 3, 6, 5, 2, 1, 7],
-    [3, 6, 5, 1, 2, 4, 7],
-    [5, 4, 6, 1, 2, 3, 7],
-    [1, 2, 3, 6, 4, 5, 7],
-    [4, 7, 3, 1, 2, 5, 6],
-    [3, 6, 2, 5, 4, 7, 1],
-    [3, 1, 5, 6, 2, 4, 7],
-    [4, 2, 6, 5, 1, 3, 7],
-    [1, 6, 3, 4, 2, 5, 7],
-    [2, 6, 1, 5, 3, 7, 4],
-    [2, 6, 1, 5, 3, 7, 4],
-    [2, 4, 1, 5, 3, 7, 6],
-    [5, 6, 4, 1, 3, 2, 7],
-    [3, 7, 2, 4, 5, 6, 1],
-    [5, 3, 6, 4, 2, 1, 7],
-    [4, 2, 5, 6, 3, 1, 7],
-    [4, 5, 6, 1, 2, 3, 7],
-    [4, 5, 6, 1, 3, 2, 7],
-    [1, 4, 2, 5, 3, 6, 7],
-    [4, 7, 2, 1, 3, 5, 6],
-    [3, 6, 2, 5, 4, 7, 1],
-    [2, 1, 5, 6, 3, 4, 7],
-    [2, 1, 5, 6, 3, 4, 7],
-    [1, 6, 3, 4, 2, 5, 7],
-    [2, 5, 1, 6, 4, 7, 3],
-    [4, 6, 1, 5, 2, 7, 3],
-    [1, 4, 2, 5, 3, 6, 7],
-    [5, 6, 4, 1, 3, 2, 7],
-    [3, 6, 2, 4, 5, 7, 1],
-    [5, 4, 6, 3, 2, 1, 7],
-    [4, 1, 6, 5, 3, 2, 7],
-    [5, 6, 4, 1, 2, 3, 7],
-    [5, 4, 6, 2, 3, 1, 7],
-    [1, 3, 2, 6, 4, 5, 7],
-    [4, 7, 3, 1, 2, 5, 6],
-    [3, 6, 2, 5, 4, 7, 1],
-    [2, 1, 5, 6, 3, 4, 7],
-    [3, 1, 6, 5, 4, 2, 7],
-    [2, 6, 3, 4, 1, 5, 7],
-    [2, 5, 1, 6, 3, 7, 4],
-    [2, 7, 1, 4, 3, 6, 5],
-    [1, 4, 2, 7, 3, 5, 6],
-    [4, 6, 5, 1, 3, 2, 7],
-    [4, 6, 2, 3, 5, 7, 1],
-    [5, 4, 6, 2, 3, 1, 7],
-    [4, 1, 6, 5, 3, 2, 7],
-    [3, 6, 5, 1, 2, 4, 7],
-    [5, 4, 6, 1, 3, 2, 7],
-    [1, 4, 2, 7, 3, 5, 6],
-    [4, 7, 3, 1, 2, 6, 5],
-    [3, 6, 2, 5, 4, 7, 1],
-    [2, 1, 5, 6, 4, 3, 7],
-    [4, 1, 6, 5, 3, 2, 7],
-    [1, 5, 2, 4, 3, 6, 7],
-    [2, 5, 1, 6, 4, 7, 3],
-    [2, 7, 1, 5, 3, 6, 4],
-    [1, 4, 2, 5, 3, 7, 6],
-    [4, 6, 5, 1, 2, 3, 7],
-    [3, 6, 2, 5, 4, 7, 1],
-    [5, 4, 6, 2, 3, 1, 7],
-    [3, 1, 6, 5, 4, 2, 7],
-    [4, 6, 5, 1, 2, 3, 7],
-    [5, 4, 6, 1, 3, 2, 7],
-    [1, 4, 2, 7, 3, 5, 6],
-    [4, 7, 3, 1, 2, 6, 5],
-    [3, 6, 2, 5, 4, 7, 1],
-    [4, 1, 5, 6, 3, 2, 7],
-    [4, 1, 6, 5, 2, 3, 7],
-    [1, 5, 3, 4, 2, 6, 7],
-    [2, 5, 1, 6, 4, 7, 3],
-    [2, 6, 1, 5, 3, 7, 4],
-    [1, 4, 2, 5, 3, 7, 6],
-    [4, 6, 5, 1, 3, 2, 7],
-    [3, 7, 2, 4, 5, 6, 1],
-    [5, 4, 6, 3, 2, 1, 7],
-    [4, 1, 6, 5, 3, 2, 7],
-    [4, 6, 5, 1, 2, 3, 7],
-    [5, 4, 6, 2, 3, 1, 7],
-    [1, 3, 2, 6, 4, 5, 7],
-    [4, 7, 3, 1, 2, 6, 5],
-    [3, 6, 2, 4, 5, 7, 1],
-    [2, 1, 5, 6, 4, 3, 7],
-    [4, 1, 5, 6, 3, 2, 7],
-    [1, 5, 3, 4, 2, 7, 6],
-    [2, 5, 1, 6, 3, 7, 4],
-    [2, 7, 1, 4, 3, 6, 5],
-    [2, 4, 1, 6, 3, 7, 5],
-    [4, 6, 5, 1, 3, 2, 7],
-    [3, 6, 2, 5, 4, 7, 1],
-    [5, 4, 6, 3, 2, 1, 7],
-    [4, 1, 6, 5, 3, 2, 7],
-    [2, 6, 5, 1, 3, 4, 7],
-    [4, 5, 6, 2, 3, 1, 7],
-    [1, 4, 2, 7, 3, 6, 5],
-    [3, 7, 4, 1, 2, 5, 6],
-    [3, 7, 2, 4, 5, 6, 1],
-    [3, 1, 5, 6, 2, 4, 7],
-    [4, 1, 6, 5, 2, 3, 7],
-    [1, 6, 2, 4, 3, 5, 7],
-    [3, 5, 1, 6, 4, 7, 2],
-    [2, 6, 1, 4, 3, 7, 5],
-    [2, 4, 1, 5, 3, 6, 7],
-    [5, 6, 4, 1, 3, 2, 7],
-    [3, 7, 2, 5, 4, 6, 1],
-    [5, 4, 6, 2, 3, 1, 7],
-    [5, 1, 4, 6, 3, 2, 7],
-    [4, 6, 3, 2, 1, 5, 7],
-    [4, 5, 6, 2, 3, 1, 7],
-    [2, 4, 1, 7, 3, 6, 5],
-    [4, 7, 3, 1, 2, 5, 6],
-    [3, 6, 2, 5, 4, 7, 1],
-    [3, 1, 5, 6, 2, 4, 7],
-    [6, 1, 4, 5, 2, 3, 7],
-    [1, 7, 2, 4, 3, 5, 6],
-    [2, 5, 1, 6, 4, 7, 3],
-    [2, 7, 1, 3, 4, 5, 6],
-    [2, 3, 1, 7, 4, 6, 5],
-    [5, 4, 6, 1, 2, 3, 7],
-    [3, 7, 2, 4, 5, 6, 1],
-    [6, 4, 5, 3, 2, 1, 7],
-    [4, 2, 5, 6, 3, 1, 7],
-    [4, 6, 5, 2, 1, 3, 7],
-    [5, 4, 6, 1, 3, 2, 7],
-    [1, 3, 2, 6, 4, 5, 7],
-    [2, 7, 3, 1, 4, 5, 6],
-    [3, 6, 2, 5, 4, 7, 1],
-    [3, 1, 5, 6, 2, 4, 7],
-    [4, 1, 5, 6, 2, 3, 7],
-    [2, 5, 3, 4, 1, 6, 7],
-    [2, 6, 1, 5, 4, 7, 3],
-    [2, 7, 1, 3, 4, 6, 5],
-    [1, 4, 2, 5, 3, 7, 6],
-    [4, 6, 5, 1, 2, 3, 7],
-    [3, 7, 2, 5, 4, 6, 1],
-    [5, 4, 6, 3, 2, 1, 7],
-    [4, 1, 6, 5, 3, 2, 7],
-    [5, 6, 3, 1, 2, 4, 7],
-    [4, 5, 6, 2, 3, 1, 7],
-    [1, 3, 2, 6, 4, 5, 7],
-    [4, 7, 3, 1, 2, 6, 5],
-    [3, 6, 2, 5, 4, 7, 1],
-    [2, 1, 5, 6, 3, 4, 7],
-    [4, 1, 5, 6, 2, 3, 7],
-    [1, 5, 2, 4, 3, 6, 7],
-    [2, 5, 1, 6, 4, 7, 3],
-    [3, 6, 1, 5, 4, 7, 2],
-    [2, 4, 1, 5, 3, 7, 6],
-    [5, 4, 6, 1, 2, 3, 7],
-    [4, 6, 2, 3, 5, 7, 1],
-    [6, 4, 5, 2, 3, 1, 7],
-    [3, 1, 6, 5, 4, 2, 7],
-    [6, 5, 4, 1, 2, 3, 7],
-    [6, 4, 5, 1, 2, 3, 7],
-    [1, 3, 2, 7, 4, 6, 5],
-    [4, 7, 2, 1, 3, 6, 5],
-    [4, 6, 2, 5, 3, 7, 1],
-    [2, 1, 5, 6, 3, 4, 7],
-    [4, 1, 6, 5, 2, 3, 7],
-    [1, 5, 3, 4, 2, 6, 7],
-    [2, 5, 1, 6, 3, 7, 4],
-    [3, 6, 1, 5, 2, 7, 4],
-    [2, 4, 1, 5, 3, 7, 6],
-    [5, 6, 4, 1, 3, 2, 7],
-    [4, 6, 2, 3, 5, 7, 1],
-    [5, 4, 6, 3, 2, 1, 7],
-    [4, 1, 6, 5, 3, 2, 7],
-    [4, 6, 5, 1, 2, 3, 7],
-    [6, 4, 5, 1, 3, 2, 7],
-    [1, 3, 2, 7, 4, 5, 6],
-    [4, 7, 3, 1, 2, 5, 6],
-    [3, 7, 2, 4, 5, 6, 1],
-    [3, 1, 5, 6, 2, 4, 7],
-    [4, 1, 5, 6, 2, 3, 7],
-    [2, 5, 3, 4, 1, 6, 7],
-    [2, 5, 1, 6, 3, 7, 4],
-    [2, 6, 1, 5, 4, 7, 3],
-    [1, 4, 2, 6, 3, 5, 7],
-    [4, 5, 6, 1, 2, 3, 7],
-    [4, 7, 2, 3, 5, 6, 1],
-    [5, 3, 6, 4, 2, 1, 7],
-    [4, 1, 6, 5, 3, 2, 7],
-    [5, 6, 4, 1, 2, 3, 7],
-    [5, 4, 6, 2, 3, 1, 7],
-    [1, 3, 2, 6, 4, 5, 7],
-    [4, 7, 2, 1, 3, 6, 5],
-    [3, 6, 2, 5, 4, 7, 1],
-    [3, 1, 5, 6, 2, 4, 7],
-    [4, 1, 6, 5, 3, 2, 7],
-    [3, 5, 2, 4, 1, 6, 7],
-    [2, 6, 1, 5, 3, 7, 4],
-    [2, 7, 1, 4, 3, 6, 5],
-    [1, 4, 2, 6, 3, 5, 7],
-    [4, 5, 6, 1, 3, 2, 7],
-    [3, 7, 2, 4, 5, 6, 1],
-    [5, 3, 6, 4, 2, 1, 7],
-    [4, 1, 6, 5, 3, 2, 7],
-    [5, 6, 4, 1, 2, 3, 7],
-    [4, 5, 6, 2, 3, 1, 7],
-    [1, 4, 2, 6, 3, 5, 7],
-    [4, 7, 3, 1, 2, 5, 6],
-    [3, 6, 2, 5, 4, 7, 1],
-    [2, 1, 5, 6, 3, 4, 7],
-    [4, 1, 6, 5, 2, 3, 7],
-    [2, 5, 3, 4, 1, 6, 7],
-    [2, 5, 1, 6, 3, 7, 4],
-    [2, 6, 1, 4, 3, 7, 5],
-    [1, 4, 2, 5, 3, 6, 7],
-    [4, 5, 6, 1, 3, 2, 7],
-    [3, 6, 2, 4, 5, 7, 1],
-    [5, 4, 6, 2, 3, 1, 7],
-    [4, 2, 6, 5, 3, 1, 7],
-    [4, 6, 5, 1, 2, 3, 7],
-    [5, 4, 6, 2, 3, 1, 7],
-    [1, 3, 2, 6, 4, 5, 7],
-    [4, 7, 2, 1, 3, 6, 5],
-    [3, 6, 2, 5, 4, 7, 1],
-    [3, 1, 5, 6, 2, 4, 7],
-    [4, 1, 6, 5, 2, 3, 7],
-    [1, 5, 3, 4, 2, 6, 7],
-    [2, 5, 1, 6, 3, 7, 4],
-    [2, 6, 1, 4, 3, 7, 5],
-    [1, 4, 2, 5, 3, 6, 7],
-    [4, 5, 6, 1, 3, 2, 7],
-    [3, 6, 2, 5, 4, 7, 1],
-    [5, 4, 6, 2, 3, 1, 7],
-    [4, 1, 6, 5, 3, 2, 7],
-    [4, 6, 5, 1, 2, 3, 7],
-    [4, 5, 6, 1, 3, 2, 7],
-    [1, 3, 2, 6, 4, 5, 7],
-    [4, 7, 3, 1, 2, 6, 5]
-])
-
-# Infer structure
-n_obs = raw_data.shape[0]
-items = raw_data.shape[1]
-
-# Choose a participant/trial structure
-participants = 15
-trials = n_obs // participants
-
-if participants * trials != n_obs:
-    raise ValueError("Data size not divisible by participants — adjust participants count.")
-
-rows = []
-idx = 0
-for p in range(1, participants + 1):
-    for t in range(1, trials + 1):
-        rows.append([p, t] + raw_data[idx].tolist())
-        idx += 1
-
-df = pd.DataFrame(rows, columns=["participant", "trial"] + [f"m{i}" for i in range(1, items + 1)])
-df.to_csv("multiphonics_rankings.csv", index=False)
-
-print(f"Loaded real dataset: {participants} participants × {trials} trials × {items} items")
-
-
-
-# =============================================================================
-# SECTION A — Data → Plackett–Luce ranking tensors
-# =============================================================================
-# Each row: participant s, trial r, and m_j = rank position of multiphonic j
-# (1 = most preferred). We convert to k_sr = (item at rank 1, …, item at rank N)
-# with items coded 0 … N−1 internally (paper uses 1 … N).
-
-
-def rankings_from_csv(path: str | Path) -> np.ndarray:
-    """
-    Load CSV produced above. Returns rankings[s, r, :] : int, item indices 0..N-1
-    (best → worst). We stack explicitly so NumPy does not silently ragged-promote.
-    """
-    table = pd.read_csv(path)
-    s_ids = sorted(table["participant"].astype(int).unique().tolist())
-    S = len(s_ids)
-    s_map = {sid: i for i, sid in enumerate(s_ids)}
-    trials_by_s = [set() for _ in range(S)]
-    for _, row in table.iterrows():
-        trials_by_s[s_map[int(row["participant"])]].add(int(row["trial"]))
-    R = max(len(trials_by_s[i]) for i in range(S))
-    N = len([c for c in table.columns if c.startswith("m")])
-
-    out: list[list[np.ndarray | None]] = [[None] * R for _ in range(S)]
-
-    for _, row in table.iterrows():
-        sid = int(row["participant"])
-        tid = int(row["trial"])
-        si, ri = s_map[sid], tid - 1
-        rank_vals = np.array([int(row[f"m{j}"]) for j in range(1, N + 1)], dtype=float)
-        order = np.argsort(rank_vals).astype(int)
-        out[si][ri] = order
-
-    for si in range(S):
-        for ri in range(R):
-            if out[si][ri] is None:
-                raise ValueError(f"Missing ranking for participant index {si}, trial {ri + 1}")
-
-    return np.stack([[np.asarray(out[si][ri], dtype=int) for ri in range(R)] for si in range(S)])
-
-
-# =============================================================================
-# SECTION B — GM06 / paper17 mean squared distance in R^D
-# =============================================================================
-# d(y, x_j) = (1/D) * sum_d (y_d - x_{j,d})^2  (Main 11 text, eq. after GM06 cite)
-
-
-def mean_sq_distances(y: np.ndarray, X: np.ndarray) -> np.ndarray:
-    """
-    y : (D,), X : (N, D)
-    Returns d of length N with d[j] = (1/D) * ||y - x_j||^2 (row-wise).
-    """
-    D = y.shape[0]
-    diff = X - y  # (N, D)
-    return np.sum(diff * diff, axis=1) / float(D)
-
-
-# =============================================================================
-# SECTION C — Plackett–Luce log-likelihood for one complete ranking
-# =============================================================================
-# P(k | η) = ∏_t exp(η_{k_t}) / sum_{u≥t} exp(η_{k_u})   (sequential choice)
-
-
-def log_plackett_luce_one(ordered_items: np.ndarray, eta: np.ndarray) -> float:
-    """
-    ordered_items: length N, indices 0..N-1, best → worst.
-    At stage t the t-th chosen item is ordered_items[t]; denominator sums exp(eta)
-    over all items not yet chosen (standard Plackett–Luce sequential construction).
-    """
-    order = ordered_items.astype(int)
-    remaining = set(order.tolist())
-    logp = 0.0
-    for t in range(len(order)):
-        j = int(order[t])
-        rem = np.array(list(remaining), dtype=int)
-        et = eta[rem]
-        m = np.max(et)
-        log_den = m + np.log(np.sum(np.exp(et - m)))
-        logp += eta[j] - log_den
-        remaining.remove(j)
-    return logp
-
-
-def eta_sr(y: np.ndarray, X: np.ndarray, c: np.ndarray, b_s: float) -> np.ndarray:
-    """η_sr,j = c_j − b_s * d(y, x_j) with mean-squared distance d."""
-    dvec = mean_sq_distances(y, X)
-    return c - b_s * dvec
-
-
-# =============================================================================
-# SECTION D — Log-prior (Main 11, Appendix A.3; Gaussian + Gamma)
-# =============================================================================
-# y_sr, x_j ~ N(0, I_D), c_j ~ N(0,1), b_s ~ Gamma(shape=25, scale=1/24)
-
-
-def logpdf_normal(x: np.ndarray, sigma2: float) -> float:
-    """Independent N(0, sigma2) components."""
-    return -0.5 * np.sum(x * x) / sigma2 - 0.5 * x.size * np.log(2 * np.pi * sigma2)
-
-
-def logpdf_gamma_scalar(b: float, shape: float = 25.0, scale: float = 1.0 / 24.0) -> float:
-    if b <= 0:
-        return -np.inf
-    k, theta = shape, scale
-    return (k - 1.0) * math.log(b) - b / theta - k * math.log(theta) - math.lgamma(k)
-
-
-def logpdf_gamma(b: np.ndarray, shape: float = 25.0, scale: float = 1.0 / 24.0) -> float:
-    """Independent Gamma(shape, scale) components (Main 11, shape–scale)."""
-    if np.any(b <= 0):
-        return -np.inf
-    return float(sum(logpdf_gamma_scalar(float(t), shape, scale) for t in b))
-
-
-def log_prior(Y: np.ndarray, X: np.ndarray, c: np.ndarray, b: np.ndarray) -> float:
-    """Joint log-prior for all latent vectors and scalars."""
-    lp = 0.0
-    S, R, D = Y.shape
-    for s in range(S):
-        for r in range(R):
-            lp += logpdf_normal(Y[s, r], 1.0)
-    lp += logpdf_normal(X.reshape(-1), 1.0)
-    lp += logpdf_normal(c, 1.0)
-    lp += logpdf_gamma(b)
-    return lp
-
-
-# =============================================================================
-# SECTION E — Full log-posterior kernel (Main 11, Appendix A.4)
-# =============================================================================
-
-
-def log_likelihood_sr(
-    Y: np.ndarray,
-    X: np.ndarray,
-    c: np.ndarray,
-    b: np.ndarray,
-    rankings: np.ndarray,
-    s: int,
-    r: int,
-) -> float:
-    """Contribution of ranking (s, r) to the log-likelihood (Main 11 factorization)."""
-    return log_likelihood_sr_yvec(Y[s, r], X, c, float(b[s]), rankings[s, r])
-
-
-def log_likelihood_sr_yvec(y: np.ndarray, X: np.ndarray, c: np.ndarray, b_s: float, rank_vec: np.ndarray) -> float:
-    """Same as log_likelihood_sr but with an explicit y vector (avoids full Y copies in MH)."""
-    eta = eta_sr(y, X, c, b_s)
-    return log_plackett_luce_one(rank_vec, eta)
-
-
-def log_likelihood_all(Y: np.ndarray, X: np.ndarray, c: np.ndarray, b: np.ndarray, rankings: np.ndarray) -> float:
-    S, R, _ = Y.shape
-    return sum(
-        log_likelihood_sr(Y, X, c, b, rankings, s, r) for s in range(S) for r in range(R)
+def build_dataframe(raw: np.ndarray, r_tasks: int = R_TASKS) -> pd.DataFrame:
+    n_obs, items = raw.shape
+    if n_obs % r_tasks != 0:
+        raise ValueError(f"{n_obs} rows not divisible by R = {r_tasks} targets.")
+    participants = n_obs // r_tasks
+    rows = []
+    idx = 0
+    for s in range(1, participants + 1):
+        for r in range(1, r_tasks + 1):  # participant-major, target = row mod R
+            rows.append([s, r] + raw[idx].tolist())
+            idx += 1
+    return pd.DataFrame(
+        rows, columns=["participant", "target"] + [f"m{j}" for j in range(1, items + 1)]
     )
 
 
-def log_likelihood_participant(
-    Y: np.ndarray, X: np.ndarray, c: np.ndarray, b: np.ndarray, rankings: np.ndarray, s: int
-) -> float:
-    """Sum of log-likelihood terms involving participant s (used for b_s updates)."""
-    return sum(log_likelihood_sr(Y, X, c, b, rankings, s, r) for r in range(Y.shape[1]))
+# =============================================================================
+# SECTION A -- Data -> Plackett-Luce ranking tensors
+# =============================================================================
+# rankings[s, r, :] = item indices (0..N-1) ordered best -> worst for
+# participant s (0-based) and orchestral target r (0-based).
 
 
-def log_posterior(
-    Y: np.ndarray,
-    X: np.ndarray,
-    c: np.ndarray,
-    b: np.ndarray,
-    rankings: np.ndarray,
-) -> float:
-    """
-    log p(Y, X, c, b | data) up to additive constant:
-      likelihood × priors
-    rankings.shape = (S, R, N): item indices best → worst.
-    """
-    return log_likelihood_all(Y, X, c, b, rankings) + log_prior(Y, X, c, b)
+def rankings_from_csv(path: str | Path) -> np.ndarray:
+    table = pd.read_csv(path)
+    s_ids = sorted(table["participant"].astype(int).unique().tolist())
+    r_ids = sorted(table["target"].astype(int).unique().tolist())
+    S, R = len(s_ids), len(r_ids)
+    s_map = {v: i for i, v in enumerate(s_ids)}
+    r_map = {v: i for i, v in enumerate(r_ids)}
+    N = len([col for col in table.columns if col.startswith("m")])
+
+    out = np.full((S, R, N), -1, dtype=int)
+    for _, row in table.iterrows():
+        si, ri = s_map[int(row["participant"])], r_map[int(row["target"])]
+        rank_vals = np.array([int(row[f"m{j}"]) for j in range(1, N + 1)])
+        out[si, ri] = np.argsort(rank_vals)  # best -> worst item indices
+    if np.any(out < 0):
+        raise ValueError("Missing (participant, target) ranking cells.")
+    return out
 
 
 # =============================================================================
-# SECTION F — Stack latent coordinates for Procrustes (paper17 §4.1)
+# SECTION B -- Squared Euclidean distances (NEW: no 1/D factor)
 # =============================================================================
-# C = [all y_sr rows; all x_j rows], shape ((S*R + N), D)
+
+
+def sq_dist_row(y: np.ndarray, X: np.ndarray) -> np.ndarray:
+    """d[j] = ||y - x_j||^2 (plain squared Euclidean; GM06's 1/D factor removed)."""
+    diff = X - y
+    return np.einsum("jd,jd->j", diff, diff)
+
+
+def sq_dist_matrix(Y: np.ndarray, X: np.ndarray) -> np.ndarray:
+    """Dm[r, j] = ||y_r - x_j||^2, shape (R, N). Cached and updated incrementally."""
+    diff = Y[:, None, :] - X[None, :, :]
+    return np.einsum("rjd,rjd->rj", diff, diff)
+
+
+# =============================================================================
+# SECTION C -- Plackett-Luce log-likelihood (vectorized, log-sum-exp stable)
+# =============================================================================
+# For eta (…, N) and orders (…, N) [item indices best -> worst]:
+#   log P = sum_t eta[k_t] - sum_t logsumexp(eta[k_t], ..., eta[k_N])
+# The stage-t denominator is a *suffix* logsumexp of eta re-ordered by rank,
+# computed in one pass with np.logaddexp.accumulate on the reversed axis.
+
+
+def log_pl_batch(eta: np.ndarray, orders: np.ndarray) -> float:
+    """
+    eta    : (..., N) support scores
+    orders : (..., N) integer item indices, best -> worst
+    Returns the SUM of Plackett-Luce log-probabilities over all leading axes.
+    """
+    e = np.take_along_axis(eta, orders, axis=-1)          # eta sorted by rank position
+    suffix_lse = np.logaddexp.accumulate(e[..., ::-1], axis=-1)  # lse over suffixes
+    return float(np.sum(e) - np.sum(suffix_lse))
+
+
+def log_pl_naive(order: np.ndarray, eta: np.ndarray) -> float:
+    """Reference O(N^2) implementation (validation only)."""
+    remaining = list(order.astype(int))
+    logp = 0.0
+    for t in range(len(remaining)):
+        rem = np.array(remaining[t:], dtype=int)
+        m = np.max(eta[rem])
+        logp += eta[order[t]] - (m + np.log(np.sum(np.exp(eta[rem] - m))))
+    return logp
+
+
+# =============================================================================
+# SECTION D -- Log-priors
+# =============================================================================
+
+
+def logpdf_normal(x: np.ndarray, sigma2: float = 1.0) -> float:
+    return -0.5 * np.sum(x * x) / sigma2 - 0.5 * x.size * math.log(2 * math.pi * sigma2)
+
+
+GAMMA_SHAPE, GAMMA_SCALE = 25.0, 1.0 / 24.0
+_GAMMA_LOGNORM = -GAMMA_SHAPE * math.log(GAMMA_SCALE) - math.lgamma(GAMMA_SHAPE)
+
+
+def logpdf_gamma_scalar(bval: float) -> float:
+    if bval <= 0:
+        return -np.inf
+    return (GAMMA_SHAPE - 1.0) * math.log(bval) - bval / GAMMA_SCALE + _GAMMA_LOGNORM
+
+
+def log_prior(Y: np.ndarray, X: np.ndarray, c: np.ndarray, b: np.ndarray) -> float:
+    return (
+        logpdf_normal(Y)                     # y_r ~ N(0, I_D), r = 1..R
+        + logpdf_normal(X)                   # x_j ~ N(0, I_D)
+        + logpdf_normal(c)                   # c_j ~ N(0, 1)
+        + float(sum(logpdf_gamma_scalar(float(t)) for t in b))
+    )
+
+
+# =============================================================================
+# SECTION E -- Log-likelihood blocks (locality-aware, using cached Dm)
+# =============================================================================
+# eta for participant s, target r:  eta_sr = c - b_s * Dm[r]
+# y_r enters the rankings of ALL participants for target r (column r);
+# b_s enters ALL targets of participant s (row s); x_j, c_j enter everything.
+
+
+def ll_target(Dm_r: np.ndarray, c: np.ndarray, b: np.ndarray, orders_r: np.ndarray) -> float:
+    """Sum over participants of log P(k_sr) for one target r.
+    Dm_r: (N,) distances; orders_r: (S, N)."""
+    eta = c[None, :] - b[:, None] * Dm_r[None, :]          # (S, N)
+    return log_pl_batch(eta, orders_r)
+
+
+def ll_participant(Dm: np.ndarray, c: np.ndarray, b_s: float, orders_s: np.ndarray) -> float:
+    """Sum over targets of log P(k_sr) for one participant s.
+    Dm: (R, N); orders_s: (R, N)."""
+    eta = c[None, :] - b_s * Dm                            # (R, N)
+    return log_pl_batch(eta, orders_s)
+
+
+def ll_all(Dm: np.ndarray, c: np.ndarray, b: np.ndarray, rankings: np.ndarray) -> float:
+    """Full log-likelihood: rankings (S, R, N)."""
+    eta = c[None, None, :] - b[:, None, None] * Dm[None, :, :]   # (S, R, N)
+    return log_pl_batch(eta, rankings)
+
+
+def log_posterior(Y, X, c, b, rankings) -> float:
+    return ll_all(sq_dist_matrix(Y, X), c, b, rankings) + log_prior(Y, X, c, b)
+
+
+# =============================================================================
+# SECTION F -- Configuration stacking for Procrustes
+# =============================================================================
+# C = [y_1; ...; y_R; x_1; ...; x_N], shape (R + N, D).
+# c_j and b_s are NOT part of the configuration (rotation/translation invariant).
 
 
 def stack_configuration(Y: np.ndarray, X: np.ndarray) -> np.ndarray:
-    S, R, D = Y.shape
-    N = X.shape[0]
-    rows = [Y[s, r] for s in range(S) for r in range(R)]
-    rows.extend([X[j] for j in range(N)])
-    return np.vstack(rows)
+    return np.vstack([Y, X])
 
 
-def unstack_configuration(C: np.ndarray, S: int, R: int, N: int) -> tuple[np.ndarray, np.ndarray]:
-    sr = S * R
-    Y = C[:sr].reshape(S, R, -1)
-    X = C[sr:].reshape(N, -1)
-    return Y, X
+def unstack_configuration(C: np.ndarray, R: int, N: int) -> tuple[np.ndarray, np.ndarray]:
+    return C[:R].copy(), C[R:].copy()
 
 
 # =============================================================================
-# SECTION G — Orthogonal Procrustes: match centered Ĉ to centered C_R (paper17)
+# SECTION G -- Orthogonal Procrustes alignment
 # =============================================================================
-# Minimize ||C_R - Ĉ Q||_F with Q orthogonal ⇒ Q = U V' for SVD(Ĉ' C_R) after
-# column centering; then aligned Ĉ* = Ĉ Q (rows are points).
+# min_Q ||C_ref - C_hat Q||_F over orthogonal Q after row-centering both.
+# Reflections are permitted: the squared-Euclidean likelihood is invariant to
+# translation, rotation AND reflection, so the unconstrained orthogonal
+# solution Q = U V' (SVD of C_hat' C_ref) is used without a det(Q) > 0 guard.
 
 
-def center_rows(C: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    mu = C.mean(axis=0)
-    return C - mu, mu
+def center_rows(C: np.ndarray) -> np.ndarray:
+    return C - C.mean(axis=0)
 
 
-def orthogonal_procrustes(C_ref: np.ndarray, C_tilt: np.ndarray) -> np.ndarray:
-    """
-    Find orthogonal Q (D×D) minimizing ||C_ref - C_tilt @ Q||_F
-    after both are row-centered (caller should center; we center again defensively).
-    Returns Q.
-    """
-    A, _ = center_rows(C_ref)
-    B, _ = center_rows(C_tilt)
-    M = B.T @ A  # D×D
-    U, _, Vt = np.linalg.svd(M, full_matrices=True)
-    Q = U @ Vt
-    # guard against reflection if det(Q)<0 (optional: paper allows rotation)
-    if np.linalg.det(Q) < 0:
-        U[:, -1] *= -1
-        Q = U @ Vt
-    return Q
+def orthogonal_procrustes(C_ref: np.ndarray, C_hat: np.ndarray) -> np.ndarray:
+    A, B = center_rows(C_ref), center_rows(C_hat)
+    U, _, Vt = np.linalg.svd(B.T @ A, full_matrices=True)
+    return U @ Vt
 
 
 def align_to_reference(Y: np.ndarray, X: np.ndarray, CR: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Translate + rotate (Y, X) stacked as paper17 so the stacked matrix best
-    matches fixed reference CR (already centered in our pipeline).
-    """
-    S, R, D = Y.shape
-    N = X.shape[0]
     C_hat = stack_configuration(Y, X)
-    mu_hat, _ = center_rows(C_hat)
-    # reference is already centered around origin in our construction
     Q = orthogonal_procrustes(CR, C_hat)
-    C_aligned = (C_hat - C_hat.mean(0)) @ Q
-    return unstack_configuration(C_aligned, S, R, N)
+    C_aligned = center_rows(C_hat) @ Q
+    return unstack_configuration(C_aligned, Y.shape[0], X.shape[0])
 
 
 # =============================================================================
-# SECTION H — Metropolis–Hastings (Main 11 Appendix A.5 + paper17 MAP phase)
+# SECTION H -- Metropolis-Hastings sampler
 # =============================================================================
-# One sweep:
-#   (1) each y_sr — Gaussian RW, acceptance with (2) from paper17 (symmetric q).
-#   (2) each x_j
-#   (3) each c_j
-#   (4) each b_s — log-scale RW, Hastings factor b*/b (see text).
-#
-# Phase MAP (paper17 §4.1): for n_map_iter iterations accept only if log-posterior
-# increases (strict uphill). The centered stacked MAP configuration becomes C_R.
-#
-# After burn-in on the sampling phase, each stored iteration applies Procrustes
-# to C_R (Main 11 Appendix A.6: draw-by-draw alignment).
+# One sweep: (1) each y_r, (2) each x_j, (3) each c_j -- Gaussian RW, symmetric
+# proposals (Hastings ratio 1); (4) each b_s -- log-scale RW, acceptance
+# includes the Jacobian term log(b*/b).
+# MAP phase: strict uphill moves on the posterior density (Jacobian not
+# included -- MAP maximizes the density of b itself, not of log b).
+# Sampling phase: standard MH; after every sweep the configuration is
+# Procrustes-aligned to the MAP reference C_R; post-burn-in draws stored.
 
 
 def mcmc_latent_pl(
     rankings: np.ndarray,
     D: int,
     *,
-    # Short defaults keep a full (S,R)=(20,15) grid tractable; raise toward paper values.
-    n_iter: int = 80,
-    n_map: int = 45,
-    burn_in: int = 25,
+    n_iter: int = 800,
+    n_map: int = 150,
+    burn_in: int = 200,
     sigma_prop_y: float = 0.25,
     sigma_prop_x: float = 0.08,
     sigma_prop_c: float = 0.12,
     sigma_prop_log_b: float = 0.12,
     seed: int = 0,
+    verbose: bool = True,
 ) -> dict:
     rng = np.random.default_rng(seed)
-    S, R = rankings.shape[0], rankings.shape[1]
-    N = int(rankings.shape[2])
+    S, R, N = rankings.shape
 
-    # Initialization (diffuse but consistent with priors)
-    Y = rng.normal(size=(S, R, D))
+    # Initialization from the priors
+    Y = rng.normal(size=(R, D))          # <-- (R, D): one point per target, SHARED
     X = rng.normal(size=(N, D))
     c = rng.normal(size=N)
-    b = rng.gamma(25.0, 1.0 / 24.0, size=S)
+    b = rng.gamma(GAMMA_SHAPE, GAMMA_SCALE, size=S)
 
-    # -------- MAP / uphill phase (paper17): build reference configuration --------
+    Dm = sq_dist_matrix(Y, X)            # cached (R, N) squared distances
+    orders_by_target = [rankings[:, r, :] for r in range(R)]   # each (S, N)
+
+    accept = {"y": 0, "x": 0, "c": 0, "b": 0}
+    total = {"y": 0, "x": 0, "c": 0, "b": 0}
+
+    def sweep(uphill: bool) -> None:
+        nonlocal Y, X, c, b, Dm
+        # (1) y_r : column-r likelihood + N(0, I) prior
+        for r in range(R):
+            prop = Y[r] + rng.normal(scale=sigma_prop_y, size=D)
+            d_new = sq_dist_row(prop, X)
+            log_a = (
+                ll_target(d_new, c, b, orders_by_target[r]) + logpdf_normal(prop)
+                - ll_target(Dm[r], c, b, orders_by_target[r]) - logpdf_normal(Y[r])
+            )
+            total["y"] += 1
+            if (log_a > 0) if uphill else (np.log(rng.random()) < min(0.0, log_a)):
+                Y[r] = prop
+                Dm[r] = d_new
+                accept["y"] += 1
+        # (2) x_j : affects every ranking; only column j of Dm changes
+        for j in range(N):
+            prop = X[j] + rng.normal(scale=sigma_prop_x, size=D)
+            col_new = np.einsum("rd,rd->r", Y - prop, Y - prop)   # (R,)
+            Dm_new = Dm.copy()
+            Dm_new[:, j] = col_new
+            log_a = (
+                ll_all(Dm_new, c, b, rankings) + logpdf_normal(prop)
+                - ll_all(Dm, c, b, rankings) - logpdf_normal(X[j])
+            )
+            total["x"] += 1
+            if (log_a > 0) if uphill else (np.log(rng.random()) < min(0.0, log_a)):
+                X[j] = prop
+                Dm = Dm_new
+                accept["x"] += 1
+        # (3) c_j : affects every ranking; distances unchanged
+        for j in range(N):
+            cp = c.copy()
+            cp[j] = c[j] + rng.normal(scale=sigma_prop_c)
+            log_a = (
+                ll_all(Dm, cp, b, rankings) + logpdf_normal(np.array([cp[j]]))
+                - ll_all(Dm, c, b, rankings) - logpdf_normal(np.array([c[j]]))
+            )
+            total["c"] += 1
+            if (log_a > 0) if uphill else (np.log(rng.random()) < min(0.0, log_a)):
+                c = cp
+                accept["c"] += 1
+        # (4) b_s : row-s likelihood; log-scale RW with Jacobian in MH phase
+        for s in range(S):
+            m = math.exp(rng.normal(scale=sigma_prop_log_b))
+            b_new = b[s] * m
+            log_a = (
+                ll_participant(Dm, c, b_new, rankings[s]) + logpdf_gamma_scalar(b_new)
+                - ll_participant(Dm, c, float(b[s]), rankings[s]) - logpdf_gamma_scalar(float(b[s]))
+            )
+            if not uphill:
+                log_a += math.log(b_new / b[s])   # Jacobian of theta -> log theta
+            total["b"] += 1
+            if (log_a > 0) if uphill else (np.log(rng.random()) < min(0.0, log_a)):
+                b[s] = b_new
+                accept["b"] += 1
+
+    # -------- MAP / uphill phase: build the Procrustes reference C_R --------
     for it in range(n_map):
-        if it % 20 == 0:
+        if verbose and it % max(1, n_map // 3) == 0:
             print(f"    MAP phase {it}/{n_map} (D={D})", flush=True)
-        # (1) y_sr — only ranking (s,r) depends on y_sr; compare local likelihood + N(0,I) prior.
-        for s in range(S):
-            for r in range(R):
-                prop = Y[s, r] + rng.normal(scale=sigma_prop_y, size=D)
-                log_old = log_likelihood_sr_yvec(Y[s, r], X, c, float(b[s]), rankings[s, r]) + logpdf_normal(
-                    Y[s, r], 1.0
-                )
-                log_new = log_likelihood_sr_yvec(prop, X, c, float(b[s]), rankings[s, r]) + logpdf_normal(prop, 1.0)
-                if log_new > log_old:
-                    Y[s, r] = prop
-        # (2) x_j — likelihood depends on all rankings; recompute full likelihood (still cheap vs old y-loop).
-        for j in range(N):
-            prop_row = X[j] + rng.normal(scale=sigma_prop_x, size=D)
-            Xp = X.copy()
-            Xp[j] = prop_row
-            log_old = log_likelihood_all(Y, X, c, b, rankings) + logpdf_normal(X[j], 1.0)
-            log_new = log_likelihood_all(Y, Xp, c, b, rankings) + logpdf_normal(prop_row, 1.0)
-            if log_new > log_old:
-                X[j] = prop_row
-        # (3) c_j
-        for j in range(N):
-            cp = c.copy()
-            cp[j] = c[j] + rng.normal(scale=sigma_prop_c)
-            log_old = log_likelihood_all(Y, X, c, b, rankings) + logpdf_normal(np.array([c[j]]), 1.0)
-            log_new = log_likelihood_all(Y, X, cp, b, rankings) + logpdf_normal(np.array([cp[j]]), 1.0)
-            if log_new > log_old:
-                c = cp
-        # (4) b_s — only rankings for participant s; MAP compares posterior density (no MH Jacobian).
-        for s in range(S):
-            bp = b.copy()
-            m = np.exp(rng.normal(scale=sigma_prop_log_b))
-            bp[s] = b[s] * m
-            log_old = log_likelihood_participant(Y, X, c, b, rankings, s) + logpdf_gamma_scalar(float(b[s]))
-            log_new = log_likelihood_participant(Y, X, c, bp, rankings, s) + logpdf_gamma_scalar(float(bp[s]))
-            if log_new > log_old:
-                b = bp
+        sweep(uphill=True)
+    CR = center_rows(stack_configuration(Y, X))
 
-    C_map = stack_configuration(Y, X)
-    CR, _ = center_rows(C_map)
-
-    # -------- Sampling phase (standard MH) --------
-    samples_Y: list[np.ndarray] = []
-    samples_X: list[np.ndarray] = []
-    samples_c: list[np.ndarray] = []
-    samples_b: list[np.ndarray] = []
-
+    # -------- Sampling phase --------
+    samples_Y, samples_X, samples_c, samples_b = [], [], [], []
     for it in range(n_iter):
-        if it % max(1, n_iter // 4) == 0:
+        if verbose and it % max(1, n_iter // 4) == 0:
             print(f"    MH sampling {it}/{n_iter} (D={D})", flush=True)
-        for s in range(S):
-            for r in range(R):
-                prop = Y[s, r] + rng.normal(scale=sigma_prop_y, size=D)
-                log_a = (
-                    log_likelihood_sr_yvec(prop, X, c, float(b[s]), rankings[s, r])
-                    + logpdf_normal(prop, 1.0)
-                    - log_likelihood_sr_yvec(Y[s, r], X, c, float(b[s]), rankings[s, r])
-                    - logpdf_normal(Y[s, r], 1.0)
-                )
-                if np.log(rng.random()) < min(0.0, log_a):
-                    Y[s, r] = prop
-        for j in range(N):
-            prop_row = X[j] + rng.normal(scale=sigma_prop_x, size=D)
-            Xp = X.copy()
-            Xp[j] = prop_row
-            log_a = (
-                log_likelihood_all(Y, Xp, c, b, rankings)
-                - log_likelihood_all(Y, X, c, b, rankings)
-                + logpdf_normal(prop_row, 1.0)
-                - logpdf_normal(X[j], 1.0)
-            )
-            if np.log(rng.random()) < min(0.0, log_a):
-                X[j] = prop_row
-        for j in range(N):
-            cp = c.copy()
-            cp[j] = c[j] + rng.normal(scale=sigma_prop_c)
-            log_a = (
-                log_likelihood_all(Y, X, cp, b, rankings)
-                - log_likelihood_all(Y, X, c, b, rankings)
-                + logpdf_normal(np.array([cp[j]]), 1.0)
-                - logpdf_normal(np.array([c[j]]), 1.0)
-            )
-            if np.log(rng.random()) < min(0.0, log_a):
-                c = cp
-        for s in range(S):
-            bp = b.copy()
-            m = np.exp(rng.normal(scale=sigma_prop_log_b))
-            bp[s] = b[s] * m
-            log_a = (
-                log_likelihood_participant(Y, X, c, bp, rankings, s)
-                - log_likelihood_participant(Y, X, c, b, rankings, s)
-                + logpdf_gamma_scalar(float(bp[s]))
-                - logpdf_gamma_scalar(float(b[s]))
-                + np.log(bp[s] / b[s])
-            )
-            if np.log(rng.random()) < min(0.0, log_a):
-                b = bp
-
-        # Procrustean alignment to C_R after each iteration (paper17 §4.2; Main 11 A.6)
-        Y, X = align_to_reference(Y, X, CR)
-
-        if it >= burn_in:
+        sweep(uphill=False)
+        Y, X = align_to_reference(Y, X, CR)   # draw-by-draw Procrustes (Y, X only)
+        Dm = sq_dist_matrix(Y, X)             # distances invariant in theory; recompute
+        if it >= burn_in:                     # to preclude numerical drift
             samples_Y.append(Y.copy())
             samples_X.append(X.copy())
             samples_c.append(c.copy())
             samples_b.append(b.copy())
 
+    rates = {k: accept[k] / max(1, total[k]) for k in accept}
+    if verbose:
+        print(f"    acceptance rates (D={D}):",
+              {k: round(v, 3) for k, v in rates.items()})
+
     return {
-        "samples_Y": np.stack(samples_Y, axis=0),  # (T, S, R, D)
-        "samples_X": np.stack(samples_X, axis=0),  # (T, N, D)
-        "samples_c": np.stack(samples_c, axis=0),  # (T, N)
-        "samples_b": np.stack(samples_b, axis=0),  # (T, S)
+        "samples_Y": np.stack(samples_Y),   # (T, R, D)
+        "samples_X": np.stack(samples_X),   # (T, N, D)
+        "samples_c": np.stack(samples_c),   # (T, N)
+        "samples_b": np.stack(samples_b),   # (T, S)
         "CR": CR,
         "D": D,
+        "acceptance": rates,
     }
 
 
 # =============================================================================
-# SECTION I — Run fits for several D; print draws; interactive plots
+# SECTION I -- Validation, summaries, plots, driver
 # =============================================================================
 
 
-def summarize_draws(fit: dict, n_tail: int = 8) -> None:
-    """Print the last few posterior draws (aligned) as numeric tables."""
-    SY = fit["samples_Y"]
-    SX = fit["samples_X"]
-    Sc = fit["samples_c"]
-    Sb = fit["samples_b"]
-    T = SY.shape[0]
+def validate_likelihood(rng_seed: int = 1) -> None:
+    """Check vectorized suffix-LSE Plackett-Luce against the naive version."""
+    rng = np.random.default_rng(rng_seed)
+    N = 7
+    eta = rng.normal(scale=2.0, size=N)
+    order = rng.permutation(N)
+    fast = log_pl_batch(eta[None, :], order[None, :])
+    slow = log_pl_naive(order, eta)
+    assert abs(fast - slow) < 1e-10, (fast, slow)
+    # a full ranking over all N! permutations must sum to probability 1 (small N check)
+    from itertools import permutations
+    tot = sum(math.exp(log_pl_naive(np.array(p), eta[:4])) for p in permutations(range(4)))
+    assert abs(tot - 1.0) < 1e-10, tot
+    print("Likelihood validation passed (suffix-LSE == naive; permutations sum to 1).")
+
+
+def summarize_draws(fit: dict, n_tail: int = 6) -> None:
+    Sb, Sc = fit["samples_b"], fit["samples_c"]
+    SX, SY = fit["samples_X"], fit["samples_Y"]
+    T = Sb.shape[0]
     sl = slice(max(0, T - n_tail), T)
-    print("\n--- Posterior tail (last", n_tail, "iterations), D =", fit["D"], "---")
-    print("samples_b (rows=iter, cols=participant):\n", Sb[sl])
-    print("samples_c (rows=iter, cols=item):\n", Sc[sl])
-    print("samples_X mean over items last iter:\n", SX[-1].mean(axis=0))
-    print("one y_sr (participant 0, trial 0) last draws:\n", SY[sl, 0, 0, :])
+    print(f"\n--- Posterior tail (last {n_tail} of {T} draws), D = {fit['D']} ---")
+    print("b posterior mean (per participant):\n", np.round(Sb.mean(0), 3))
+    print("c posterior mean (per multiphonic):\n", np.round(Sc.mean(0), 3))
+    print("last draws of b (rows=iter):\n", np.round(Sb[sl], 3))
+    print("multiphonic locations, posterior mean:\n", np.round(SX.mean(0), 3))
+    print("orchestral target locations, posterior mean:\n", np.round(SY.mean(0), 3))
 
 
-def plot_latent_panel(fit: dict, rankings: np.ndarray) -> None:
-    """Slider: pick 2 dims to plot when D>2; traces for b_1, c_1."""
+def plot_latent_panel_static(fit: dict, fname: str) -> None:
     D = int(fit["D"])
-    SY = fit["samples_Y"]
-    SX = fit["samples_X"]
-    X_mean = SX.mean(axis=0)
-    Y_mean = SY.mean(axis=0)
-    S, R, _ = Y_mean.shape
-    N = X_mean.shape[0]
-
-    fig = plt.figure(figsize=(11, 7))
-    ax_scatter = fig.add_axes([0.08, 0.35, 0.45, 0.55])
-    ax_radio = fig.add_axes([0.62, 0.55, 0.15, 0.35])
-    ax_dim1 = fig.add_axes([0.62, 0.38, 0.25, 0.03])
-    ax_dim2 = fig.add_axes([0.62, 0.32, 0.25, 0.03])
-    ax_trace = fig.add_axes([0.08, 0.08, 0.85, 0.18])
-
-    if D >= 2:
-        d1, d2 = 0, 1
-    else:
-        d1, d2 = 0, 0
-
-    def redraw_scatter():
-        ax_scatter.clear()
-        if D == 1:
-            ax_scatter.axvline(X_mean[:, 0].mean(), color="steelblue", lw=2, label="items mean")
-            ax_scatter.scatter(X_mean[:, 0], np.zeros(N), c="tab:blue", s=80, label="items", zorder=3)
-            ax_scatter.scatter(Y_mean[..., 0].ravel(), np.zeros(S * R), c="tab:orange", s=12, alpha=0.4, label="y_sr")
-            ax_scatter.set_yticks([])
-            ax_scatter.set_xlabel("Dimension 1")
-        else:
-            ax_scatter.scatter(
-                X_mean[:, d1], X_mean[:, d2], c="tab:blue", s=100, label="multiphonics", zorder=3
-            )
-            for j in range(N):
-                ax_scatter.annotate(str(j + 1), (X_mean[j, d1], X_mean[j, d2]), xytext=(4, 4), textcoords="offset points")
-            ax_scatter.scatter(
-                Y_mean[..., d1].ravel(),
-                Y_mean[..., d2].ravel(),
-                c="tab:orange",
-                s=14,
-                alpha=0.35,
-                label="y_sr (participant×trial)",
-            )
-            ax_scatter.set_xlabel(f"Dim {d1 + 1}")
-            ax_scatter.set_ylabel(f"Dim {d2 + 1}")
-        ax_scatter.set_title(f"Posterior mean latent space (D={D}, Procrustes-aligned draws)")
-        ax_scatter.legend(loc="upper right", fontsize=8)
-        fig.canvas.draw_idle()
-
-    redraw_scatter()
-
-    if D >= 2:
-        s1 = Slider(ax_dim1, "x-axis dim", 0, D - 1, valinit=0, valstep=1)
-        s2 = Slider(ax_dim2, "y-axis dim", 0, D - 1, valinit=min(1, D - 1), valstep=1)
-
-        def on_slider(_val):
-            nonlocal d1, d2
-            d1, d2 = int(s1.val), int(s2.val)
-            if d1 == d2 and D > 1:
-                d2 = (d1 + 1) % D
-                s2.set_val(d2)
-            redraw_scatter()
-
-        s1.on_changed(on_slider)
-        s2.on_changed(on_slider)
-
-    # Trace for first participant sensitivity and first item appeal
-    ax_trace.clear()
-    ax_trace.plot(fit["samples_b"][:, 0], lw=0.6, label="b_1 trace")
-    ax_trace.plot(fit["samples_c"][:, 0], lw=0.6, label="c_1 trace")
-    ax_trace.legend(fontsize=7, ncol=2)
-    ax_trace.set_title("Posterior traces (aligned chain)")
-    ax_trace.set_xlabel("Saved iteration")
-
-    # Radio only useful when multiple fits passed — here single fit; still show D
-    rax = ax_radio
-    rax.clear()
-    rax.text(0.0, 0.5, f"Model\nD = {D}", transform=rax.transAxes, fontsize=10)
-    rax.set_xticks([])
-    rax.set_yticks([])
-
-    plt.show()
-
-
-def run_all_dimensions(rankings: np.ndarray, dims: tuple[int, ...] = (1, 2, 3)) -> dict[int, dict]:
-    """Fit separate models for each D (model selection / comparison)."""
-    fits: dict[int, dict] = {}
-    for j, D in enumerate(dims):
-        print(f"\n=== MCMC for latent dimension D = {D} ===")
-        fits[D] = mcmc_latent_pl(rankings, D, seed=100 + j)
-        summarize_draws(fits[D], n_tail=6)
-    return fits
-
-
-def plot_latent_panel_static(fit: dict, rankings: np.ndarray, fname: str) -> None:
-    """Non-interactive version: posterior mean scatter + traces, saved to fname."""
-    D = int(fit["D"])
-    SY, SX = fit["samples_Y"], fit["samples_X"]
-    X_mean, Y_mean = SX.mean(axis=0), SY.mean(axis=0)
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-    ax0, ax1 = axes
+    X_mean, Y_mean = fit["samples_X"].mean(0), fit["samples_Y"].mean(0)
+    fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(11, 4.5))
     if D == 1:
-        ax0.scatter(X_mean[:, 0], np.zeros(fit["samples_X"].shape[1]), c="tab:blue", s=80, label="items")
-        ax0.scatter(Y_mean[..., 0].ravel(), np.zeros(Y_mean[..., 0].size), c="tab:orange", s=10, alpha=0.35, label="y_sr")
+        ax0.scatter(X_mean[:, 0], np.zeros(len(X_mean)), c="tab:blue", s=90, label="multiphonics", zorder=3)
+        ax0.scatter(Y_mean[:, 0], np.zeros(len(Y_mean)), c="tab:orange", s=45, marker="s", label="orchestral targets")
         ax0.set_yticks([])
         ax0.set_xlabel("Dim 1")
     else:
-        d1, d2 = 0, 1
-        ax0.scatter(X_mean[:, d1], X_mean[:, d2], c="tab:blue", s=90, zorder=3, label="items")
-        for j in range(X_mean.shape[0]):
-            ax0.annotate(str(j + 1), (X_mean[j, d1], X_mean[j, d2]), xytext=(3, 3), textcoords="offset points")
-        ax0.scatter(
-            Y_mean[..., d1].ravel(),
-            Y_mean[..., d2].ravel(),
-            c="tab:orange",
-            s=12,
-            alpha=0.35,
-            label="y_sr",
-        )
+        ax0.scatter(X_mean[:, 0], X_mean[:, 1], c="tab:blue", s=110, zorder=3, label="multiphonics")
+        for j in range(len(X_mean)):
+            ax0.annotate(f"M{j+1}", X_mean[j, :2], xytext=(4, 4), textcoords="offset points", fontsize=8)
+        ax0.scatter(Y_mean[:, 0], Y_mean[:, 1], c="tab:orange", s=55, marker="s", label="orchestral targets")
+        for r in range(len(Y_mean)):
+            ax0.annotate(f"T{r+1}", Y_mean[r, :2], xytext=(4, -8), textcoords="offset points", fontsize=7, color="darkorange")
         ax0.set_xlabel("Dim 1")
         ax0.set_ylabel("Dim 2")
-    ax0.set_title(f"Posterior mean (D={D})")
-    ax0.legend(fontsize=7)
+    ax0.set_title(f"Posterior mean latent space (D={D})")
+    ax0.legend(fontsize=8)
     ax1.plot(fit["samples_b"][:, 0], lw=0.7, label="b_1")
     ax1.plot(fit["samples_c"][:, 0], lw=0.7, label="c_1")
-    ax1.legend(fontsize=7)
-    ax1.set_title("Traces")
+    ax1.legend(fontsize=8)
+    ax1.set_title("Traces (aligned chain)")
+    ax1.set_xlabel("Saved iteration")
     fig.tight_layout()
     fig.savefig(fname, dpi=150)
     plt.close(fig)
 
 
-# -----------------------------------------------------------------------------
-# Main driver: load generated CSV, fit D ∈ {1,2,3}, plots + interactive choice
-# -----------------------------------------------------------------------------
+def plot_latent_panel(fit: dict) -> None:
+    """Interactive: dimension-pair sliders (D>2) + traces."""
+    D = int(fit["D"])
+    X_mean, Y_mean = fit["samples_X"].mean(0), fit["samples_Y"].mean(0)
+    N, R = len(X_mean), len(Y_mean)
+
+    fig = plt.figure(figsize=(11, 7))
+    ax_scatter = fig.add_axes([0.08, 0.35, 0.52, 0.55])
+    ax_dim1 = fig.add_axes([0.68, 0.55, 0.25, 0.03])
+    ax_dim2 = fig.add_axes([0.68, 0.48, 0.25, 0.03])
+    ax_trace = fig.add_axes([0.08, 0.08, 0.85, 0.18])
+    d = [0, min(1, D - 1)]
+
+    def redraw():
+        ax_scatter.clear()
+        if D == 1:
+            ax_scatter.scatter(X_mean[:, 0], np.zeros(N), c="tab:blue", s=90, label="multiphonics", zorder=3)
+            ax_scatter.scatter(Y_mean[:, 0], np.zeros(R), c="tab:orange", s=45, marker="s", label="orchestral targets")
+            ax_scatter.set_yticks([])
+        else:
+            ax_scatter.scatter(X_mean[:, d[0]], X_mean[:, d[1]], c="tab:blue", s=110, zorder=3, label="multiphonics")
+            for j in range(N):
+                ax_scatter.annotate(f"M{j+1}", (X_mean[j, d[0]], X_mean[j, d[1]]),
+                                    xytext=(4, 4), textcoords="offset points", fontsize=8)
+            ax_scatter.scatter(Y_mean[:, d[0]], Y_mean[:, d[1]], c="tab:orange", s=55, marker="s", label="orchestral targets")
+            for r in range(R):
+                ax_scatter.annotate(f"T{r+1}", (Y_mean[r, d[0]], Y_mean[r, d[1]]),
+                                    xytext=(4, -8), textcoords="offset points", fontsize=7, color="darkorange")
+            ax_scatter.set_xlabel(f"Dim {d[0] + 1}")
+            ax_scatter.set_ylabel(f"Dim {d[1] + 1}")
+        ax_scatter.set_title(f"Posterior mean latent space (D={D}, Procrustes-aligned)")
+        ax_scatter.legend(loc="best", fontsize=8)
+        fig.canvas.draw_idle()
+
+    redraw()
+    if D >= 2:
+        s1 = Slider(ax_dim1, "x dim", 0, D - 1, valinit=0, valstep=1)
+        s2 = Slider(ax_dim2, "y dim", 0, D - 1, valinit=min(1, D - 1), valstep=1)
+
+        def on_slider(_):
+            d[0], d[1] = int(s1.val), int(s2.val)
+            if d[0] == d[1] and D > 1:
+                d[1] = (d[0] + 1) % D
+                s2.set_val(d[1])
+            redraw()
+
+        s1.on_changed(on_slider)
+        s2.on_changed(on_slider)
+
+    ax_trace.plot(fit["samples_b"][:, 0], lw=0.6, label="b_1 trace")
+    ax_trace.plot(fit["samples_c"][:, 0], lw=0.6, label="c_1 trace")
+    ax_trace.legend(fontsize=7, ncol=2)
+    ax_trace.set_title("Posterior traces (aligned chain)")
+    ax_trace.set_xlabel("Saved iteration")
+    plt.show()
+
+
+def run_all_dimensions(rankings: np.ndarray, dims: tuple[int, ...] = (1, 2, 3), **kw) -> dict[int, dict]:
+    fits: dict[int, dict] = {}
+    for j, D in enumerate(dims):
+        print(f"\n=== MCMC for latent dimension D = {D} ===")
+        fits[D] = mcmc_latent_pl(rankings, D, seed=100 + j, **kw)
+        summarize_draws(fits[D])
+    return fits
+
+
 if __name__ == "__main__":
     import os
 
+    validate_likelihood()
+
+    df = build_dataframe(raw_data)
+    df.to_csv("multiphonics_rankings.csv", index=False)
     rankings_np = rankings_from_csv("multiphonics_rankings.csv")
     S, R, N = rankings_np.shape
+    print(f"Loaded dataset: {S} participants x {R} orchestral targets x {N} multiphonics")
 
-    # Fit each D separately (paper17 §4.3 / Main 11 §5.4 model comparison over dimension).
     all_fits = run_all_dimensions(rankings_np, dims=(1, 2, 3))
 
     for d, fit in all_fits.items():
@@ -1109,22 +538,20 @@ if __name__ == "__main__":
         )
     print("Saved posterior_draws_D1.npz, D2, D3 (aligned chains).")
 
-    # Interactive GUI, or save static figures when MPLBACKEND=Agg (e.g. CI / servers).
     if os.environ.get("MPLBACKEND", "").lower() == "agg":
         for d, fit in all_fits.items():
-            plot_latent_panel_static(fit, rankings_np, f"latent_space_D{d}.png")
+            plot_latent_panel_static(fit, f"latent_space_D{d}.png")
         print("Saved latent_space_D1.png, latent_space_D2.png, latent_space_D3.png")
     else:
         fig_pick = plt.figure(figsize=(5, 3))
         axp = fig_pick.add_axes([0.15, 0.2, 0.7, 0.65])
-        labels = [f"D = {d}" for d in all_fits]
-        radio = RadioButtons(axp, labels, active=1)
+        radio = RadioButtons(axp, [f"D = {d}" for d in all_fits], active=1)
 
         def onselect(sel: str):
             d = int(str(sel).split("=")[1].strip())
             plt.close(fig_pick)
-            plot_latent_panel(all_fits[d], rankings_np)
+            plot_latent_panel(all_fits[d])
 
         radio.on_clicked(onselect)
-        plt.suptitle("Choose latent dimensionality to plot (close window to skip)")
+        plt.suptitle("Choose latent dimensionality to plot")
         plt.show()
